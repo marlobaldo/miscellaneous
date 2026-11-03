@@ -8,13 +8,19 @@
   const MAX_SEGMENTS = Infinity;
   /* Leave empty to auto-detect the .mpd the page loaded, or paste the manifest URL */
   const MPD_URL = "";
+  /* Segments downloaded at the same time (6 is a good default; lower it if errors appear) */
+  const PARALLEL = 6;
 
   /* ===== On-screen status (Android has no visible console) ===== */
   const box = document.createElement("div");
+  /* At the top (Android's toolbar can cover the bottom), immune to page CSS */
   box.style.cssText =
-    "position:fixed;z-index:2147483647;left:8px;right:8px;bottom:8px;" +
-    "padding:10px 12px;background:rgba(0,0,0,.85);color:#fff;" +
-    "font:14px/1.4 sans-serif;border-radius:8px;word-break:break-all";
+    "all:initial;position:fixed!important;z-index:2147483647!important;" +
+    "top:calc(8px + env(safe-area-inset-top,0px));left:8px;right:8px;" +
+    "display:block!important;visibility:visible!important;opacity:1!important;" +
+    "padding:10px 12px;background:rgba(0,0,0,.88);color:#fff;" +
+    "font:14px/1.4 sans-serif;border-radius:8px;word-break:break-word;" +
+    "box-shadow:0 2px 8px rgba(0,0,0,.4);pointer-events:none";
   const label = document.createElement("div");
   const track = document.createElement("div");
   const bar = document.createElement("div");
@@ -25,7 +31,24 @@
     "height:100%;width:0;background:#4caf50;transition:width .3s";
   track.appendChild(bar);
   box.append(label, track);
-  document.documentElement.appendChild(box);
+
+  /* Keep the box attached and visible, also when the player goes fullscreen */
+  let keepBox = true;
+  function attachBox() {
+    if (!keepBox) return;
+    const fs = document.fullscreenElement || document.webkitFullscreenElement;
+    const host = fs && fs.tagName !== "VIDEO" ? fs : document.documentElement;
+    if (box.parentNode !== host) host.appendChild(box);
+  }
+  attachBox();
+  document.addEventListener("fullscreenchange", attachBox);
+  document.addEventListener("webkitfullscreenchange", attachBox);
+  const keepTimer = setInterval(attachBox, 1000);
+  const removeBox = () => {
+    keepBox = false;
+    clearInterval(keepTimer);
+    box.parentNode && box.parentNode.removeChild(box);
+  };
 
   const status = s => { label.textContent = s; console.log(s); };
 
@@ -369,15 +392,16 @@
   }
 
   /* ===== Output: file picker on desktop Chrome, Blob download elsewhere ===== */
-  async function openOutput(name) {
+  async function openOutput(getName) {
     if (typeof showSaveFilePicker === "function") {
       try {
         const handle = await showSaveFilePicker({
-          suggestedName: name,
+          suggestedName: getName(),
           types: [{ description: "MP4 video", accept: { "video/mp4": [".mp4"] } }]
         });
         const w = await handle.createWritable();
         return {
+          name: () => handle.name,
           write: p => w.write(p),
           close: () => w.close(),
           abort: () => w.abort()
@@ -392,7 +416,9 @@
     let blobs = [];
     let pending = [];
 
+    let finalName = "";
     return {
+      name: () => finalName || getName(),
       write(p) {
         pending.push(p);
         if (pending.length >= 100) {
@@ -407,9 +433,9 @@
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = name;
+        a.download = finalName = getName();
         a.textContent = "Tap here if the download didn't start";
-        a.style.cssText = "display:block;margin-top:6px;color:#8cf";
+        a.style.cssText = "display:block;margin-top:6px;color:#8cf;pointer-events:auto";
         box.appendChild(a);
         a.click();
       },
@@ -420,12 +446,24 @@
   }
 
   /* ===== Main ===== */
-  const fileName = MAX_SEGMENTS === Infinity ? "video.mp4" : "test.mp4";
+  /* File name from the title shown next to the player (available once it plays) */
+  function fileName() {
+    let title = "";
+    try {
+      title = document.querySelector("video").parentNode.innerText.split("\n")[0];
+    } catch (e) {}
+    title = (title || "")
+      .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 120) || "video";
+    return (MAX_SEGMENTS === Infinity ? title : "test_" + title) + ".mp4";
+  }
 
   /* Open the save dialog first, while the bookmark click still counts as a user gesture */
   const out = await openOutput(fileName);
   if (!out) {
-    box.remove();
+    removeBox();
     return;
   }
 
@@ -433,7 +471,7 @@
   let initialized = false;
 
   try {
-    status("Cerco il manifest…");
+    status("v4 · Cerco il manifest…");
     const mpdUrl = await findMpd();
     if (!mpdUrl) throw Error("Nessun URL MPD");
 
@@ -535,22 +573,34 @@
     initialized = true;
 
     const pageTitle = document.title;
-    const total = Math.max(video.media.length, audio.media.length);
-    let seq = 1;
+    /* Interleave video and audio in playback order */
+    const jobs = [];
+    const pairs = Math.max(video.media.length, audio.media.length);
+    for (let i = 0; i < pairs; i++) {
+      if (i < video.media.length) jobs.push({ url: video.media[i], trackId: combined.videoTrack });
+      if (i < audio.media.length) jobs.push({ url: audio.media[i], trackId: combined.audioTrack });
+    }
+
+    /* Download several segments at once, but write them strictly in order */
+    const total = jobs.length;
+    const pending = new Map();
+    let launched = 0;
+    const launch = () => {
+      while (launched < total && launched < completed + PARALLEL) {
+        const p = get(jobs[launched].url);
+        p.catch(() => {});
+        pending.set(launched++, p);
+      }
+    };
 
     for (let i = 0; i < total; i++) {
-      for (const [list, trackId] of [
-        [video.media, combined.videoTrack],
-        [audio.media, combined.audioTrack]
-      ]) {
-        if (i >= list.length) continue;
-        const bytes = await get(list[i]);
-        bytesDone += bytes.length;
-        for (const part of fragment(bytes, trackId, seq++)) {
-          await out.write(part);
-        }
+      launch();
+      const bytes = await pending.get(i);
+      pending.delete(i);
+      bytesDone += bytes.length;
+      for (const part of fragment(bytes, jobs[i].trackId, i + 1)) {
+        await out.write(part);
       }
-
       completed = i + 1;
       progress(completed, total);
     }
@@ -558,8 +608,8 @@
     await out.close();
     document.title = pageTitle;
     bar.style.background = "#2196f3";
-    status(`Completato: ${completed} segmenti, ${mb(bytesDone)} MB in ${clock((Date.now() - startTime) / 1000)} → ${fileName}`);
-    setTimeout(() => box.remove(), 60000);
+    status(`Completato: ${completed} segmenti, ${mb(bytesDone)} MB in ${clock((Date.now() - startTime) / 1000)} → ${out.name()}`);
+    setTimeout(removeBox, 60000);
 
   } catch (error) {
     console.error(error);
@@ -572,6 +622,6 @@
       status(`Error: ${error.message}`);
     }
 
-    setTimeout(() => box.remove(), 60000);
+    setTimeout(removeBox, 60000);
   }
 })();
